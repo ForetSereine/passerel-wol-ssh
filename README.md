@@ -1,4 +1,4 @@
-# whonix-by-foret
+# passerel-wol-ssh
 
 # Remote wake-up and SSH access through a Debian gateway
 
