@@ -1,0 +1,160 @@
+#!/bin/bash
+# ============================================================
+#  install_target.sh : run AS ROOT ON the machine to wake up,
+#  booted into Linux (apt-based distribution : Debian, Ubuntu,
+#  Kali, Mint...).
+#
+#  Sets up :
+#    key-only SSH server, accepted ONLY from the Debian
+#    gateway ; firewall (IPv6 closed) ;
+#    Wake-on-LAN enabled persistently on the network card.
+#
+#  WARNING : after this script, every incoming connection to
+#  this machine is refused, except SSH from the gateway.
+#  Outgoing connections (web, games, updates) still work.
+#
+#  See README.md for the full procedure.
+# ============================================================
+set -euo pipefail
+
+# ------------------------------------------------------------
+# CONFIGURATION : fill in before the first run
+# ------------------------------------------------------------
+ADMIN_USER=""        # your account on this machine (whoami), not root
+PROXY_LAN_IP=""      # local IP of the Debian gateway (e.g. 192.168.1.10)
+SSH_PORT="22"        # SSH port of this machine
+NIC=""               # Ethernet card to wake (ip link : eth0, enp3s0...)
+# ------------------------------------------------------------
+
+info() { echo "[i] $*"; }
+ok()   { echo "[ok] $*"; }
+warn() { echo "[!] $*"; }
+die()  { echo "[x] $*" >&2; exit 1; }
+
+valid_ipv4() {
+    local ip=$1 o
+    [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+}
+valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+valid_user() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+
+# ------------------------------------------------------------
+# 0. Preliminary checks
+# ------------------------------------------------------------
+[[ $EUID -eq 0 ]] || die "Must be run as root : sudo $0"
+
+missing=()
+for v in ADMIN_USER PROXY_LAN_IP NIC; do [[ -n ${!v} ]] || missing+=("$v"); done
+(( ${#missing[@]} == 0 )) || die "Fill in the CONFIGURATION block : ${missing[*]}"
+
+valid_user "$ADMIN_USER"   || die "Invalid ADMIN_USER : '$ADMIN_USER'"
+[[ $ADMIN_USER != root ]]  || die "ADMIN_USER must not be root"
+valid_ipv4 "$PROXY_LAN_IP" || die "Invalid PROXY_LAN_IP : '$PROXY_LAN_IP'"
+valid_port "$SSH_PORT"     || die "Invalid SSH_PORT : '$SSH_PORT'"
+ip link show "$NIC" >/dev/null 2>&1 || die "Interface '$NIC' not found (see : ip link)"
+[[ -d /sys/class/net/$NIC/wireless ]] \
+    && warn "$NIC looks like a Wi-Fi card : Wake-on-LAN only works reliably over Ethernet."
+
+id "$ADMIN_USER" >/dev/null 2>&1 || die "User $ADMIN_USER does not exist"
+home=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
+[[ -s "$home/.ssh/authorized_keys" ]] \
+    || die "No key for $ADMIN_USER : run ssh-copy-id from the client first (see README)."
+
+if [[ -n ${SSH_CONNECTION:-} && ${SSH_CONNECTION%% *} != "$PROXY_LAN_IP" ]]; then
+    warn "You are connected over SSH from ${SSH_CONNECTION%% *}. This session will stay"
+    warn "open, but future connections will have to go through the gateway."
+fi
+
+# ------------------------------------------------------------
+# 1. Packages
+# ------------------------------------------------------------
+info "Installing packages ..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq \
+    || die "apt-get update failed : your repositories are misconfigured (see README, Troubleshooting)."
+apt-get install -y -qq openssh-server iptables iptables-persistent ethtool \
+    || die "Cannot install packages (see README, Troubleshooting)."
+
+# ------------------------------------------------------------
+# 2. Firewall : SSH from the gateway only, IPv6 closed
+# ------------------------------------------------------------
+install -d -m 755 /etc/iptables
+cat > /etc/iptables/rules.v4 <<EOF
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+-A INPUT -p tcp -s ${PROXY_LAN_IP}/32 --dport ${SSH_PORT} -m conntrack --ctstate NEW -j ACCEPT
+COMMIT
+EOF
+cat > /etc/iptables/rules.v6 <<'EOF'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p ipv6-icmp -j ACCEPT
+COMMIT
+EOF
+chmod 600 /etc/iptables/rules.v4 /etc/iptables/rules.v6
+iptables-restore --test  < /etc/iptables/rules.v4 || die "Invalid IPv4 rules"
+ip6tables-restore --test < /etc/iptables/rules.v6 || die "Invalid IPv6 rules"
+iptables-restore  < /etc/iptables/rules.v4
+ip6tables-restore < /etc/iptables/rules.v6
+systemctl enable netfilter-persistent >/dev/null 2>&1
+ok "Firewall active (SSH from ${PROXY_LAN_IP} only)."
+
+# ------------------------------------------------------------
+# 3. sshd : keys only
+# ------------------------------------------------------------
+install -d -m 755 /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
+# Generated by install_target.sh
+Port ${SSH_PORT}
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+AllowUsers ${ADMIN_USER}
+MaxAuthTries 3
+LoginGraceTime 20
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitTunnel no
+EOF
+sshd -t || die "Invalid sshd configuration"
+systemctl enable --now ssh >/dev/null 2>&1
+systemctl reload ssh
+ok "sshd active (keys only)."
+
+# ------------------------------------------------------------
+# 4. Persistent Wake-on-LAN (mode g = magic packet)
+# ------------------------------------------------------------
+cat > /etc/systemd/system/wol@.service <<'EOF'
+[Unit]
+Description=Enable Wake-on-LAN on %i
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ethtool -s %i wol g
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now "wol@${NIC}.service" >/dev/null 2>&1
+ethtool "$NIC" | grep -E 'Wake-on' || true
+if ! ethtool "$NIC" | grep -qE '^\s*Wake-on: .*g'; then
+    warn "Card $NIC does not confirm mode 'g' : check the driver and the BIOS."
+fi
+
+echo
+ok "Target configured. Remaining : WoL in the BIOS/UEFI, Linux as default boot entry (see README)."
