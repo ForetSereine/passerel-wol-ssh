@@ -1,0 +1,296 @@
+#!/bin/bash
+# ============================================================
+#  install_proxy_debian.sh : run AS ROOT ON the Debian server
+#  that acts as the gateway (Debian 12 or 13).
+#
+#  Sets up :
+#    IPv4 allowlist firewall (SSH only), IPv6 closed,
+#    key-only sshd, jump account restricted to the WoL
+#    wake-up and to the target's SSH port only,
+#    fail2ban (systemd backend), sysctl hardening.
+#
+#  Lock-out safeguards : the script refuses to continue if the
+#  admin account has no SSH key, if your current IP is not in
+#  the allowlist, or if the sshd config is invalid. The firewall
+#  is rolled back automatically unless you confirm within 60 s.
+#  The script can be run again safely.
+#
+#  See README.md for the full procedure.
+# ============================================================
+set -euo pipefail
+
+# ------------------------------------------------------------
+# CONFIGURATION : fill in before the first run
+# ------------------------------------------------------------
+ADMIN_USER=""        # your admin account on this Debian (whoami), not root
+JUMP_USER="jumpuser" # jump account created by the script (no shell)
+SSH_PORT="22"        # SSH port of this Debian
+TARGET_IP=""         # local IP of the machine to wake (e.g. 192.168.1.20)
+TARGET_PORT="22"     # SSH port of the machine to wake
+TARGET_MAC=""        # MAC of its Ethernet card (e.g. AA:BB:CC:DD:EE:FF)
+LAN_BROADCAST=""     # local network broadcast (e.g. 192.168.1.255)
+
+# IPs allowed to connect, AS SEEN BY THIS DEBIAN.
+# One address per line, in straight double quotes. A client
+# with both Wi-Fi AND cable has two addresses : add both.
+WHITELIST=(
+  # "192.168.1.30"
+)
+
+# Optional : path of a .pub file (copied onto this Debian) to
+# authorize for the jump account. Empty = do it by hand.
+JUMP_PUBKEY_FILE=""
+
+# Wake-up command. Alternative : the assembly binary
+#   WOL_CMD="/usr/local/bin/wol ${TARGET_MAC} ${LAN_BROADCAST}"
+WOL_CMD="/usr/bin/wakeonlan -i ${LAN_BROADCAST} ${TARGET_MAC}"
+# ------------------------------------------------------------
+
+info() { echo "[i] $*"; }
+ok()   { echo "[ok] $*"; }
+warn() { echo "[!] $*"; }
+die()  { echo "[x] $*" >&2; exit 1; }
+
+valid_ipv4() {
+    local ip=$1 o
+    [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+}
+valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+valid_user() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+
+# ------------------------------------------------------------
+# 0. Preliminary checks
+# ------------------------------------------------------------
+[[ $EUID -eq 0 ]] || die "Must be run as root : sudo $0"
+
+missing=()
+for v in ADMIN_USER TARGET_IP TARGET_MAC LAN_BROADCAST; do
+    [[ -n ${!v} ]] || missing+=("$v")
+done
+(( ${#missing[@]} == 0 )) || die "Fill in the CONFIGURATION block : ${missing[*]}"
+(( ${#WHITELIST[@]} > 0 )) || die "WHITELIST is empty : add at least your client's IP"
+
+valid_user "$ADMIN_USER" || die "Invalid ADMIN_USER : '$ADMIN_USER'"
+valid_user "$JUMP_USER"  || die "Invalid JUMP_USER : '$JUMP_USER'"
+[[ $ADMIN_USER != root ]] || die "ADMIN_USER must not be root (root login is disabled)"
+[[ $ADMIN_USER != "$JUMP_USER" ]] || die "ADMIN_USER and JUMP_USER must differ"
+valid_port "$SSH_PORT"    || die "Invalid SSH_PORT : '$SSH_PORT'"
+valid_port "$TARGET_PORT" || die "Invalid TARGET_PORT : '$TARGET_PORT'"
+valid_ipv4 "$TARGET_IP"   || die "Invalid TARGET_IP : '$TARGET_IP'"
+valid_ipv4 "$LAN_BROADCAST" || die "Invalid LAN_BROADCAST : '$LAN_BROADCAST'"
+[[ $TARGET_MAC =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]] \
+    || die "Invalid TARGET_MAC : '$TARGET_MAC' (format AA:BB:CC:DD:EE:FF)"
+for ip in "${WHITELIST[@]}"; do
+    valid_ipv4 "$ip" || die "Invalid WHITELIST IP : '$ip' (empty line or extra character ?)"
+done
+
+id "$ADMIN_USER" >/dev/null 2>&1 || die "User $ADMIN_USER does not exist on this Debian"
+admin_home=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
+[[ -s "$admin_home/.ssh/authorized_keys" ]] \
+    || die "$ADMIN_USER has no key in $admin_home/.ssh/authorized_keys : run ssh-copy-id from the client first (see README)."
+
+if [[ -n $JUMP_PUBKEY_FILE ]]; then
+    [[ -f $JUMP_PUBKEY_FILE ]] || die "JUMP_PUBKEY_FILE not found : $JUMP_PUBKEY_FILE"
+    ssh-keygen -lf "$JUMP_PUBKEY_FILE" >/dev/null 2>&1 \
+        || die "JUMP_PUBKEY_FILE is not a valid public key"
+fi
+
+# Connected over SSH ? The current IP must be allowed.
+if [[ -n ${SSH_CONNECTION:-} ]]; then
+    cur_ip=${SSH_CONNECTION%% *}
+    found=0
+    for ip in "${WHITELIST[@]}"; do [[ $ip == "$cur_ip" ]] && found=1; done
+    (( found )) || die "Your current IP ($cur_ip) is not in WHITELIST : you would be locked out."
+fi
+
+# ------------------------------------------------------------
+# 1. Packages
+# ------------------------------------------------------------
+info "Installing packages ..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq \
+    || die "apt-get update failed : your repositories are misconfigured (see README, Troubleshooting)."
+apt-get install -y -qq wakeonlan iptables iptables-persistent fail2ban python3-systemd \
+    || die "Cannot install packages (see README, Troubleshooting)."
+
+# ------------------------------------------------------------
+# 2. Jump account (no password, keys only)
+# ------------------------------------------------------------
+if ! id "$JUMP_USER" >/dev/null 2>&1; then
+    adduser --disabled-password --gecos "" "$JUMP_USER"
+fi
+jump_home=$(getent passwd "$JUMP_USER" | cut -d: -f6)
+install -d -m 700 -o "$JUMP_USER" -g "$JUMP_USER" "$jump_home/.ssh"
+ak="$jump_home/.ssh/authorized_keys"
+touch "$ak"
+if [[ -n $JUMP_PUBKEY_FILE ]] && ! grep -qF "$(awk '{print $2}' "$JUMP_PUBKEY_FILE")" "$ak"; then
+    cat "$JUMP_PUBKEY_FILE" >> "$ak"
+    ok "Public key added to account $JUMP_USER."
+fi
+chown "$JUMP_USER:$JUMP_USER" "$ak"
+chmod 600 "$ak"
+[[ -s $ak ]] || warn "Account $JUMP_USER has no key yet : add it afterwards (see README)."
+
+# ------------------------------------------------------------
+# 3. IPv4 + IPv6 firewall
+# ------------------------------------------------------------
+info "Generating firewall rules ..."
+install -d -m 755 /etc/iptables
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+rules4="$tmpdir/rules.v4"; rules6="$tmpdir/rules.v6"
+
+{
+    echo "*filter"
+    echo ":INPUT DROP [0:0]"
+    echo ":FORWARD DROP [0:0]"
+    echo ":OUTPUT ACCEPT [0:0]"
+    echo "-A INPUT -i lo -j ACCEPT"
+    echo "-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+    echo "-A INPUT -m conntrack --ctstate INVALID -j DROP"
+    echo "-A INPUT -p icmp --icmp-type echo-request -m limit --limit 5/second -j ACCEPT"
+    # SSH : allowlist + rate limit on new connections
+    for ip in "${WHITELIST[@]}"; do
+        echo "-A INPUT -p tcp -s ${ip}/32 --dport ${SSH_PORT} -m conntrack --ctstate NEW -m hashlimit --hashlimit-name ssh_new --hashlimit-mode srcip --hashlimit-upto 10/minute --hashlimit-burst 5 -j ACCEPT"
+    done
+    echo "COMMIT"
+} > "$rules4"
+
+# IPv6 : no SSH. ICMPv6 kept (required by IPv6).
+cat > "$rules6" <<'EOF'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p ipv6-icmp -j ACCEPT
+COMMIT
+EOF
+
+iptables-restore --test < "$rules4"  || die "Invalid IPv4 rules"
+ip6tables-restore --test < "$rules6" || die "Invalid IPv6 rules"
+
+# Back up the current rules for rollback
+iptables-save  > "$tmpdir/old.v4"
+ip6tables-save > "$tmpdir/old.v6"
+iptables-restore  < "$rules4"
+ip6tables-restore < "$rules6"
+
+if [[ -t 0 ]]; then
+    # Flush the keyboard buffer (keys typed ahead must not answer)
+    while IFS= read -r -t 0.05 -n 1 _; do :; done
+    echo
+    echo "================================================================"
+    echo " New firewall active. From the CLIENT, open a NEW"
+    echo " connection :  ssh ${ADMIN_USER}@<this-debian-ip>"
+    echo " If it works, type y then Enter here."
+    echo " Without an answer within 60 s, the old firewall is restored."
+    echo "================================================================"
+    ans=""
+    if ! read -r -t 60 -p "Does the new connection work ? [y/N] " ans \
+       || [[ ! $ans =~ ^[yYoO] ]]; then
+        echo
+        iptables-restore  < "$tmpdir/old.v4"
+        ip6tables-restore < "$tmpdir/old.v6"
+        die "Firewall cancelled, old rules restored. Fix WHITELIST and run again."
+    fi
+fi
+
+install -m 600 "$rules4" /etc/iptables/rules.v4
+install -m 600 "$rules6" /etc/iptables/rules.v6
+systemctl enable netfilter-persistent >/dev/null 2>&1   # reload at boot
+ok "Firewall active (IPv4 allowlist, IPv6 closed)."
+
+# ------------------------------------------------------------
+# 4. sshd
+# ------------------------------------------------------------
+info "Configuring sshd ..."
+cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+
+# sshd_config.d is read before the rest and the 1st value wins :
+# the 00- prefix comes before a possible 50-cloud-init.conf.
+install -d -m 755 /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
+# Generated by install_proxy_debian.sh
+Port ${SSH_PORT}
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+AuthenticationMethods publickey
+AllowUsers ${ADMIN_USER} ${JUMP_USER}
+MaxAuthTries 3
+MaxSessions 4
+LoginGraceTime 20
+MaxStartups 10:30:60
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+GatewayPorts no
+PermitTunnel no
+PermitUserEnvironment no
+LogLevel VERBOSE
+EOF
+
+# Match block at the END of the main file. Jump account :
+# no shell session, the only possible command is the wake-up,
+# the only allowed forwarding is the target's SSH port (ssh -J).
+sed -i '/^# >>> wol-jump/,/^# <<< wol-jump/d' /etc/ssh/sshd_config
+cat >> /etc/ssh/sshd_config <<EOF
+# >>> wol-jump (managed by install_proxy_debian.sh)
+Match User ${JUMP_USER}
+    AllowTcpForwarding local
+    PermitOpen ${TARGET_IP}:${TARGET_PORT}
+    PermitTTY no
+    X11Forwarding no
+    AllowAgentForwarding no
+    ForceCommand ${WOL_CMD}
+# <<< wol-jump
+EOF
+
+sshd -t || die "Invalid sshd configuration, nothing was reloaded (backup available)."
+systemctl reload ssh
+ok "sshd reloaded (keys only, restricted jump account)."
+
+# ------------------------------------------------------------
+# 5. fail2ban (systemd backend : no /var/log/auth.log on Debian 12+)
+# ------------------------------------------------------------
+cat > /etc/fail2ban/jail.d/sshd-local.conf <<EOF
+[sshd]
+enabled  = true
+backend  = systemd
+port     = ${SSH_PORT}
+maxretry = 3
+findtime = 10m
+bantime  = 1h
+bantime.increment = true
+bantime.maxtime   = 1w
+EOF
+fail2ban-client -t >/dev/null || die "Invalid fail2ban configuration"
+systemctl enable fail2ban >/dev/null 2>&1
+systemctl restart fail2ban
+ok "fail2ban active."
+
+# ------------------------------------------------------------
+# 6. sysctl (dedicated file : re-running adds no duplicates)
+# ------------------------------------------------------------
+cat > /etc/sysctl.d/90-hardening.conf <<'EOF'
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.ip_forward = 0
+EOF
+sysctl --system >/dev/null
+ok "sysctl applied."
+
+echo
+ok "Gateway configured. Test a new connection from the client BEFORE closing this session."
